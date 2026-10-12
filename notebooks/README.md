@@ -25,4 +25,4 @@ Two habits worth having from the start:
 
 Write your assigned seed here so you don't lose it:
 
-    STUDENT_SEED =
+    STUDENT_SEED = 6
