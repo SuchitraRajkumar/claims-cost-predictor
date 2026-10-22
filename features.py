@@ -74,21 +74,26 @@ VALID_VERDICTS = ("safe", "leaky", "debatable", "not_a_feature")
 # spending happens. Keep that timeline in mind.
 # ---------------------------------------------------------------------------
 FEATURE_AUDIT: dict[str, tuple[str, str]] = {
-    "age_bucket": ("TODO", ""),
-    "sex": ("TODO", ""),
-    "region": ("TODO", ""),
-    "total_claims": ("TODO", ""),
-    "medical_claims": ("TODO", ""),
-    "pharmacy_claims": ("TODO", ""),
-    "specialty_drug_fills": ("TODO", ""),
-    "total_billed_cents": ("TODO", ""),
-    "total_allowed_cents": ("TODO", ""),
-    "total_plan_paid_cents": ("TODO", ""),
-    "total_oop_cents": ("TODO", ""),
-    "unique_diagnosis_codes": ("TODO", ""),
-    "inpatient_claims": ("TODO", ""),
-    "has_specialty_drug": ("TODO", ""),
-    "is_high_cost": ("TODO", ""),
+    "age_bucket": ("safe", "enrollment fact, known on Jan 1"),
+    "sex": ("safe", "enrollment fact, known on Jan 1"),
+    "region": ("safe", "enrollment fact, known on Jan 1"),
+    # Counts of care. Debatable: they come from the same year as the label, but
+    # a real plan would use LAST year's counts, which are known on Jan 1. They
+    # do not contain the dollars the label is made from (single-column AUC
+    # 0.71-0.87, far below the 0.99 leak line), so I use them as a stand-in for
+    # prior-year history. In production they must be rebuilt from prior-year claims.
+    "total_claims": ("debatable", "same year as label; stand-in for last year's claim count"),
+    "medical_claims": ("debatable", "same year as label; stand-in for last year's medical use"),
+    "pharmacy_claims": ("debatable", "same year as label; stand-in for last year's pharmacy use"),
+    "specialty_drug_fills": ("debatable", "same year as label; stand-in for last year's specialty fills"),
+    "total_billed_cents": ("leaky", "this year's dollars; ranks the label at AUC 0.97 and is nearly the same number as plan-paid"),
+    "total_allowed_cents": ("leaky", "plan-paid plus member share; nearly restates the label (AUC 0.998)"),
+    "total_plan_paid_cents": ("leaky", "this is the label's source column: is_high_cost is cut from it"),
+    "total_oop_cents": ("leaky", "the member's slice of the same claims whose plan-paid defines the label; only known once claims adjudicate"),
+    "unique_diagnosis_codes": ("debatable", "same year as label; stand-in for last year's diagnosis history"),
+    "inpatient_claims": ("debatable", "same year as label; stand-in for last year's inpatient stays"),
+    "has_specialty_drug": ("debatable", "same year as label; stand-in for being on a specialty drug last year"),
+    "is_high_cost": ("not_a_feature", "the label itself, known only after Dec 31"),
 }
 
 
@@ -112,7 +117,7 @@ def approved_claims(claims: pd.DataFrame) -> pd.DataFrame:
 
     Roughly 8% of claims are denied, so this line changes your numbers.
     """
-    raise NotImplementedError("Implement approved_claims()")
+    return claims[claims["adjudication_status"] == "approved"].copy()
 
 
 def build_member_features(members: pd.DataFrame, claims: pd.DataFrame) -> pd.DataFrame:
@@ -146,7 +151,30 @@ def build_member_features(members: pd.DataFrame, claims: pd.DataFrame) -> pd.Dat
         for them. Should their total_claims be NaN, or 0? Whatever you choose,
         the column dtypes should still be numeric.
     """
-    raise NotImplementedError("Implement build_member_features()")
+    agg = claims.groupby("member_id").agg(
+        total_claims=("claim_id", "count"),
+        medical_claims=("is_pharmacy", lambda s: (~s.astype(bool)).sum()),
+        pharmacy_claims=("is_pharmacy", lambda s: s.astype(bool).sum()),
+        specialty_drug_fills=("is_specialty_drug", lambda s: s.astype(bool).sum()),
+        total_billed_cents=("billed_cents", "sum"),
+        total_allowed_cents=("allowed_cents", "sum"),
+        total_plan_paid_cents=("plan_paid_cents", "sum"),
+        total_oop_cents=("out_of_pocket_cents", "sum"),
+        # nunique() skips NaN, so pharmacy claims (no diagnosis) are not counted
+        unique_diagnosis_codes=("diagnosis_code", "nunique"),
+        inpatient_claims=("claim_type", lambda s: (s == "Institutional").sum()),
+        has_specialty_drug=("is_specialty_drug", lambda s: s.astype(bool).any()),
+    ).reset_index()
+
+    # Left join keeps members with no approved claims; for them "no claims"
+    # is a fact (0), not missing data, so fill and restore integer dtypes.
+    table = members.merge(agg, on="member_id", how="left")
+    fill_cols = [c for c in agg.columns if c != "member_id"]
+    table[fill_cols] = table[fill_cols].fillna(0)
+    int_cols = [c for c in fill_cols if c != "has_specialty_drug"]
+    table[int_cols] = table[int_cols].astype(int)
+    table["has_specialty_drug"] = table["has_specialty_drug"].astype(bool)
+    return table
 
 
 def add_label(features: pd.DataFrame) -> pd.DataFrame:
@@ -160,7 +188,10 @@ def add_label(features: pd.DataFrame) -> pd.DataFrame:
     Write the one line that creates the label, then look hard at which column
     you just used. You will need that thought in TODO 4.
     """
-    raise NotImplementedError("Implement add_label()")
+    features["is_high_cost"] = (
+        features["total_plan_paid_cents"] > HIGH_COST_THRESHOLD_CENTS
+    ).astype(int)
+    return features
 
 
 def model_features() -> list[str]:
@@ -171,7 +202,10 @@ def model_features() -> list[str]:
     changing a verdict above changes what the model sees. Decide for yourself
     whether "debatable" columns are in or out, and be ready to defend it.
     """
-    raise NotImplementedError("Implement model_features()")
+    # Position on "debatable": IN. The counts are a fair stand-in for last
+    # year's history (see the audit comments); "leaky" and "not_a_feature" are out.
+    keep = ("safe", "debatable")
+    return [col for col in AUDITABLE_COLUMNS if FEATURE_AUDIT[col][0] in keep]
 
 
 def print_audit() -> None:
