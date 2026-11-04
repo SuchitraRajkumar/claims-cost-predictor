@@ -18,12 +18,24 @@ Check your work:
 """
 
 import joblib
+import matplotlib
+
+matplotlib.use("Agg")  # write PNGs without needing a display
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import (
+    average_precision_score,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
 from sklearn.model_selection import train_test_split
 
 from config import HIGH_COST_THRESHOLD_USD
+from train import TARGET
 
 DATA_PATH = Path("data/member_summary.csv")
 MODEL_PATH = Path("model.joblib")
@@ -55,9 +67,21 @@ RANDOM_STATE = 42
 # ---------------------------------------------------------------------------
 VALID_USE_CASES = ("care_management", "stop_loss", "pricing")
 
-CHOSEN_USE_CASE = "TODO"
-CHOSEN_THRESHOLD = None
-THRESHOLD_JUSTIFICATION = ""
+CHOSEN_USE_CASE = "care_management"
+CHOSEN_THRESHOLD = 0.15
+THRESHOLD_JUSTIFICATION = (
+    "Nurses call members the model flags, so I want to miss as few high-cost "
+    "members as possible. At 0.15 the 400-member test set flags 55 members, "
+    "reaches 20 of the 23 real high-cost members (recall 0.87) and nets the "
+    "most money on the sweep, $66,250 at $4,000 saved per catch and $250 per "
+    "call. The mistake I am choosing to make more often is the wasted call: "
+    "precision is only 0.36, so about 2 of every 3 calls go to a member who "
+    "would not have been high-cost. I accept that because a call costs $250 "
+    "and a missed member costs far more, and because going lower to 0.05 "
+    "catches just 2 more members for 36 extra calls and a lower net. If the "
+    "team can only make about 25 calls, 0.35 is the fallback: it reaches 11 "
+    "of 23 members for $37,750."
+)
 
 # Rough economics for the care-management case, in dollars. Change them if your
 # use case implies different numbers, and say so in your write-up.
@@ -82,7 +106,17 @@ def load_holdout() -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
     hard-coding them:
         pipeline["preprocessor"].feature_names_in_
     """
-    raise NotImplementedError("Implement load_holdout()")
+    pipeline = joblib.load(MODEL_PATH)
+    summary = pd.read_csv(DATA_PATH)
+    features = list(pipeline["preprocessor"].feature_names_in_)
+    X = summary[features]
+    y = summary[TARGET].astype(int)
+
+    _, X_test, _, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
+    )
+    y_proba = pipeline.predict_proba(X_test)[:, 1]
+    return X_test, y_test, y_proba
 
 
 def threshold_sweep(y_true, y_proba, thresholds=None) -> pd.DataFrame:
@@ -99,7 +133,29 @@ def threshold_sweep(y_true, y_proba, thresholds=None) -> pd.DataFrame:
     there. Decide what you want to report (0.0 is fine) rather than letting
     numpy hand you a nan and a warning.
     """
-    raise NotImplementedError("Implement threshold_sweep()")
+    if thresholds is None:
+        thresholds = np.arange(0.05, 1.0, 0.05)
+
+    y_true = np.asarray(y_true).astype(bool)
+    y_proba = np.asarray(y_proba)
+
+    rows = []
+    for threshold in thresholds:
+        flagged = y_proba >= threshold
+        tp = int((flagged & y_true).sum())
+        fp = int((flagged & ~y_true).sum())
+        fn = int((~flagged & y_true).sum())
+        n_flagged = tp + fp
+        rows.append({
+            "threshold": round(float(threshold), 2),
+            "n_flagged": n_flagged,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "precision": tp / n_flagged if n_flagged else 0.0,
+            "recall": tp / (tp + fn) if (tp + fn) else 0.0,
+        })
+    return pd.DataFrame(rows)
 
 
 def expected_value(tp: int, fp: int, outreach_cost: float, savings_per_tp: float) -> float:
@@ -112,7 +168,7 @@ def expected_value(tp: int, fp: int, outreach_cost: float, savings_per_tp: float
     This is a deliberately crude model of the world. Its job is to make the
     trade-off explicit, not to be right.
     """
-    raise NotImplementedError("Implement expected_value()")
+    return tp * savings_per_tp - (tp + fp) * outreach_cost
 
 
 def plot_curves(y_true, y_proba, out_path: Path = REPORT_DIR / "evaluation_curves.png") -> Path:
@@ -136,7 +192,52 @@ def plot_curves(y_true, y_proba, out_path: Path = REPORT_DIR / "evaluation_curve
     Use matplotlib (pip install -r requirements-dev.txt) and remember to
     out_path.parent.mkdir(exist_ok=True) before saving.
     """
-    raise NotImplementedError("Implement plot_curves()")
+    y_true = np.asarray(y_true)
+    y_proba = np.asarray(y_proba)
+    threshold = CHOSEN_THRESHOLD
+
+    fig, (ax_roc, ax_pr, ax_cal) = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    fpr, tpr, roc_thresholds = roc_curve(y_true, y_proba)
+    ax_roc.plot(fpr, tpr, label=f"ROC-AUC = {roc_auc_score(y_true, y_proba):.3f}")
+    ax_roc.plot([0, 1], [0, 1], "k--", alpha=0.4, label="coin flip")
+    ax_roc.set(xlabel="False positive rate", ylabel="Recall (true positive rate)", title="ROC")
+
+    precision, recall, _ = precision_recall_curve(y_true, y_proba)
+    ax_pr.plot(recall, precision, label=f"PR-AUC = {average_precision_score(y_true, y_proba):.3f}")
+    ax_pr.axhline(y_true.mean(), color="k", linestyle="--", alpha=0.4, label="coin flip")
+    ax_pr.set(xlabel="Recall", ylabel="Precision", title="Precision-recall")
+
+    if threshold is not None:
+        flagged = y_proba >= threshold
+        tp = (flagged & (y_true == 1)).sum()
+        fp = (flagged & (y_true == 0)).sum()
+        ax_roc.scatter(
+            [fp / max((y_true == 0).sum(), 1)], [tp / max((y_true == 1).sum(), 1)],
+            color="tab:orange", zorder=3, label=f"chosen cut {threshold}",
+        )
+        ax_pr.scatter(
+            [tp / max((y_true == 1).sum(), 1)], [tp / max(flagged.sum(), 1)],
+            color="tab:orange", zorder=3, label=f"chosen cut {threshold}",
+        )
+
+    frac_positive, mean_predicted = calibration_curve(
+        y_true, y_proba, n_bins=10, strategy="quantile"
+    )
+    ax_cal.plot([0, 1], [0, 1], "k--", alpha=0.4, label="perfectly calibrated")
+    ax_cal.plot(mean_predicted, frac_positive, "o-", label="model")
+    ax_cal.set(
+        xlabel="Mean predicted score", ylabel="Share really high-cost", title="Calibration"
+    )
+
+    for ax in (ax_roc, ax_pr, ax_cal):
+        ax.legend(loc="best")
+    fig.tight_layout()
+
+    out_path.parent.mkdir(exist_ok=True)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
 
 
 def main() -> None:
