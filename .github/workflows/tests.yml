@@ -13,13 +13,6 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
 
-    env:
-      # One Week 4 test fails from day one by design (see README). CI sets it
-      # aside so a green tick means "everything I have written so far works".
-      # You switch it on in Week 4.
-      PYTEST_ADDOPTS: >-
-        --deselect tests/test_leakage.py::test_training_features_are_leak_free
-
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +58,12 @@ jobs:
       # runs on the PR itself, so you will see whether you got it right before
       # anything reaches main.
       # -------------------------------------------------------------------
-      - name: Run the test suite
+      # model.joblib is git-ignored, so CI has to train one. Without it the
+      # model and evaluation tests have nothing to load.
+      - name: Generate data and train the model
         run: |
-          echo "::error file=.github/workflows/tests.yml::This step is still a TODO."
-          exit 1
+          python generate_claims_data.py
+          python train.py
+
+      - name: Run the test suite
+        run: pytest -v
