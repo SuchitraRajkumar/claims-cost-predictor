@@ -58,5 +58,12 @@ jobs:
       # runs on the PR itself, so you will see whether you got it right before
       # anything reaches main.
       # -------------------------------------------------------------------
+      # model.joblib is git-ignored, so CI has to train one. Without it the
+      # model and evaluation tests have nothing to load.
+      - name: Generate data and train the model
+        run: |
+          python generate_claims_data.py
+          python train.py
+
       - name: Run the test suite
         run: pytest -v
