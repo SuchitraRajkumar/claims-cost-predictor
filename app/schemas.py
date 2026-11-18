@@ -41,8 +41,16 @@ class MemberFeatures(BaseModel):
     them sending medical_claims=5 with total_claims=1.
     """
 
-    # TODO: replace this line with your fields.
-    ...
+    age_bucket: Literal["18-29", "30-39", "40-49", "50-59", "60-64"]
+    sex: Literal["F", "M"]
+    region: Literal["Midwest", "Northeast", "Southeast", "Southwest", "West"]
+    total_claims: int = Field(ge=0)
+    medical_claims: int = Field(ge=0)
+    pharmacy_claims: int = Field(ge=0)
+    specialty_drug_fills: int = Field(ge=0)
+    unique_diagnosis_codes: int = Field(ge=0)
+    inpatient_claims: int = Field(ge=0)
+    has_specialty_drug: bool
 
 
 class PredictionResponse(BaseModel):
@@ -58,5 +66,6 @@ class PredictionResponse(BaseModel):
     a different threshold and a caller has a number with no idea what it means.
     """
 
-    # TODO: replace this line with your fields.
-    ...
+    is_high_cost: bool
+    probability: float = Field(ge=0.0, le=1.0)
+    threshold_dollars: int
