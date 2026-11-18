@@ -23,9 +23,31 @@ from app.schemas import MemberFeatures, PredictionResponse
 from config import HIGH_COST_THRESHOLD_USD
 
 MODEL_PATH = Path("model.joblib")
-DECISION_THRESHOLD = 0.5  # the threshold you defended in Week 5
+DECISION_THRESHOLD = 0.15  # the care_management cut defended in Week 5
 
 model = None
+
+
+def impossible_combinations(f: MemberFeatures) -> list[str]:
+    """
+    Combinations that pass field-by-field validation but cannot be true.
+
+    The model would score them anyway, and the answer would look like any other
+    probability. We refuse them with a 422 instead of quietly fixing them: if
+    the caller's data is inconsistent, they need to know, not get a guess.
+    """
+    problems = []
+    if f.medical_claims + f.pharmacy_claims != f.total_claims:
+        problems.append("medical_claims + pharmacy_claims must equal total_claims")
+    if f.inpatient_claims > f.medical_claims:
+        problems.append("inpatient_claims cannot exceed medical_claims")
+    if f.specialty_drug_fills > f.pharmacy_claims:
+        problems.append("specialty_drug_fills cannot exceed pharmacy_claims")
+    if f.unique_diagnosis_codes > f.medical_claims:
+        problems.append("unique_diagnosis_codes cannot exceed medical_claims")
+    if f.has_specialty_drug != (f.specialty_drug_fills > 0):
+        problems.append("has_specialty_drug must match whether specialty_drug_fills > 0")
+    return problems
 
 
 @asynccontextmanager
@@ -45,8 +67,15 @@ async def lifespan(app: FastAPI):
 
     Everything before `yield` runs at startup, everything after at shutdown.
     """
-    raise NotImplementedError("Implement the lifespan handler")
-    yield  # noqa: unreachable until you implement the TODO above
+    global model
+    if not MODEL_PATH.exists():
+        raise RuntimeError(
+            f"{MODEL_PATH} not found. Run `python train.py` to create it before "
+            "starting the API."
+        )
+    model = joblib.load(MODEL_PATH)
+    yield
+    model = None
 
 
 app = FastAPI(
@@ -67,7 +96,7 @@ def health():
     than hard-coding True; "the process is up" and "the service can serve" are
     different claims.
     """
-    raise NotImplementedError("Implement GET /health")
+    return {"status": "ok", "model_loaded": model is not None}
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -95,4 +124,17 @@ def predict(features: MemberFeatures):
     nonsense (pharmacy_claims greater than total_claims, say). FastAPI will not
     catch that for you.
     """
-    raise NotImplementedError("Implement POST /predict")
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model is not loaded.")
+
+    problems = impossible_combinations(features)
+    if problems:
+        raise HTTPException(status_code=422, detail=problems)
+
+    row = pd.DataFrame([features.model_dump()])
+    probability = float(model.predict_proba(row)[:, 1][0])
+    return PredictionResponse(
+        is_high_cost=probability >= DECISION_THRESHOLD,
+        probability=round(probability, 4),
+        threshold_dollars=HIGH_COST_THRESHOLD_USD,
+    )
